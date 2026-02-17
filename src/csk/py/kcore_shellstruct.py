@@ -1,11 +1,8 @@
+import pickle
 from pathlib import Path
 
 import click
 import networkit as nk
-import numba
-import numpy as np
-import pandas as pd
-import scipy.sparse as sp
 
 """
 K-core with an index structure based on ShellStruct (N. Barbieri, F. Bonchi, E. Galimberti, and F. Gullo. Efficient and effective community search. DMKD, 29(5):1406–1433, 2015.)
@@ -37,9 +34,11 @@ class CLTreeNode:
         self.core_num = core_num
         self.vertex_set = set(vertices)
         self.children = set()
+        self.parent = None
 
     def add_child(self, child):
         self.children.add(child)
+        child.parent = self
 
 
 class AdvancedIndexBuilder:
@@ -168,74 +167,90 @@ def kcore():
 @click.option("--output", required=True, type=click.Path())
 def index(edgelist, output):
     graph = nk.graphio.EdgeListReader(",", 0).read(edgelist)
-    core = nk.centrality.CoreDecomposition(graph).run()
 
     # obtain index
     indexer = AdvancedIndexBuilder(graph)
     indexer.build()
 
-    data = [[node, int(core.score(node))] for node in range(graph.numberOfNodes())]
-    df = pd.DataFrame(data, columns=["node", "core"])
-
     Path(output).parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(output, index=False, header=False, sep="\t")
+    with open(output, "wb") as f:
+        pickle.dump(indexer, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 @kcore.command()
-@click.option("--edgelist", required=True, type=click.Path(exists=True))
 @click.option("--index", required=True, type=click.Path(exists=True))
 @click.option("--nodelist", required=True, type=click.Path(exists=True))
 @click.option("--outputdir", required=True, type=click.Path())
-def search(edgelist, index, nodelist, outputdir):
-    edges = np.loadtxt(edgelist, dtype=np.int64)
-    n = np.max(edges) + 1
-    row = np.concatenate([edges[:, 0], edges[:, 1]])
-    col = np.concatenate([edges[:, 1], edges[:, 0]])
-    data = np.ones(2 * len(edges), dtype=np.int8)
-    graph = sp.coo_matrix((data, (row, col)), shape=(n, n)).tocsr()
+def search(index, nodelist, outputdir):
+    with open(index, "rb") as f:
+        indexer = pickle.load(f)
 
-    cores = pd.read_csv(index, sep="\t", header=None, names=["node", "core"])
-    cores = cores.sort_values("node")["core"].to_numpy()
+    def ancestors(node):
+        """Return the set of all ancestors (including the node itself)."""
+        result = set()
+        while node is not None:
+            result.add(node)
+            node = node.parent
+        return result
 
-    @numba.njit
-    def find_kcore(indptr, indices, cores, q, k):
-        if cores[q] < k:
-            return np.empty(0, dtype=np.int64)
+    def find_kcore(queries, k):
+        """Returns (resolved_k, sorted_vertices). resolved_k is the actual
+        core number used (matters when k=-1)."""
+        nodes = []
+        for q in queries:
+            if q not in indexer.v_to_treenode:
+                return k, []
+            node = indexer.v_to_treenode[q]
+            if k == -1:
+                # just stay at the node - this is the highest k possible
+                pass
+            elif node.core_num < k:
+                return k, []
+            else:
+                # walk up to the first ancestor with core_num <= k
+                while node.parent and node.parent.core_num >= k:
+                    node = node.parent
+            nodes.append(node)
 
-        mask = cores >= k
-        visited = np.zeros(n, dtype=np.uint8)
-        stack, sidx = np.empty(n, dtype=np.int64), 0
-        out, oidx = np.empty(n, dtype=np.int64), 0
+        # intersecting ancestor sets to find LCA
+        lca_candidates = ancestors(nodes[0])
+        for node in nodes[1:]:
+            lca_candidates &= ancestors(node)
 
-        stack[0], sidx = q, sidx + 1
-        visited[q] = 1
+        if not lca_candidates:
+            return k, []
 
-        while sidx > 0:
-            v, sidx = stack[sidx - 1], sidx - 1
-            out[oidx], oidx = v, oidx + 1
+        # LCA is the deepest common ancestor (highest core_num)
+        lca = max(lca_candidates, key=lambda n: n.core_num)
 
-            for i in range(indptr[v], indptr[v + 1]):
-                u = indices[i]
-                if visited[u] == 0 and mask[u] != 0:
-                    visited[u] = 1
-                    stack[sidx], sidx = u, sidx + 1
+        if k != -1 and lca.core_num < k:
+            return k, []
 
-        return out[:oidx]
-
-    def print_kcore(q, k, outfile):
-        component = find_kcore(graph.indptr, graph.indices, cores, q, k)
-        outfile.write("\n".join(map(str, component)))
-        if len(component):
-            outfile.write("\n")
-        outfile.write("-1")
+        # collect all vertices from the LCA and its descendants
+        vertices = set()
+        stack = [lca]
+        while stack:
+            cur = stack.pop()
+            vertices.update(cur.vertex_set)
+            stack.extend(cur.children)
+        return lca.core_num, sorted(vertices)
 
     with open(nodelist) as nodefile:
         for line in nodefile.readlines():
-            q, k = line.strip().split(" ")
-            outpath = Path(outputdir) / f"{q}/kcore_k{k}.txt"
+            parts = line.strip().split(" ")
+            queries_str = parts[0]
+            k = int(parts[1]) if len(parts) > 1 else -1
+            queries = [int(q) for q in queries_str.split(",")]
+
+            resolved_k, component = find_kcore(queries, k)
+            outpath = Path(outputdir) / f"{queries_str}/kcore_k{resolved_k}.txt"
             outpath.parent.mkdir(parents=True, exist_ok=True)
+
             with outpath.open("w") as outfile:
-                print_kcore(int(q), int(k), outfile)
+                outfile.write("\n".join(map(str, component)))
+                if len(component):
+                    outfile.write("\n")
+                outfile.write("-1")
 
 
 if __name__ == "__main__":

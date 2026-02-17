@@ -77,7 +77,13 @@ def search(edgelist, index, nodelist, outputdir):
 
     with open(nodelist) as nodefile:
         for line in nodefile.readlines():
-            q, k = line.strip().split(" ")
+            parts = line.strip().split(",")
+            q = int(parts[0])
+            if len(parts) == 1:
+                k = cores[q]
+            else:
+                k = int(parts[1])
+
             outpath = Path(outputdir) / f"{q}/kcore_k{k}.txt"
             outpath.parent.mkdir(parents=True, exist_ok=True)
             with outpath.open("w") as outfile:
