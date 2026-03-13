@@ -6,8 +6,10 @@ import numba
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from scipy.sparse.csgraph import connected_components
 import collections
 from itertools import groupby
+import time
 
 
 """Note: this method solves the Multi-Query k-Core problem, which does not allow custom k's - it only works to find the k-core community a query node is in for the largest k possible."""
@@ -29,22 +31,30 @@ def _init_partitions(n):
 
 
 @numba.njit
-def _update_partition(
-    partitions, labels, new_edges, indptr, indices, cores, k_threshold
-):
+def _update_partition(partitions, labels, v_sub, indptr, indices):
     """Updates partition labels to reflect new connected components after adding E_sub.
-    new_edges: tuples of two int64 elements (v1, v2).
-    indptr, indices: CSR arrays for neighbor lookup.
-    cores: int64 array of core numbers per node.
-    k_threshold: only follow edge (u, v2) if min(cores[u], cores[v2]) >= k_threshold.
-    labels[u] == -1 means unassigned."""
+    v_sub: int64 array of vertices incident to new edges.
+    indptr, indices: CSR arrays for the accumulated k-shell edges.
+    labels[u] == -1 means unassigned.
+    Returns (pg_rows, pg_cols): partition-graph edges discovered during BFS."""
 
-    v_sub = set()
-    for i in range(len(new_edges)):
-        v_sub.add(new_edges[i, 0])
-        v_sub.add(new_edges[i, 1])
+    # typed list init trick: append+clear to set the element type
+    pg_rows = numba.typed.List()
+    pg_rows.append(np.int64(0))
+    pg_rows.clear()
+    pg_cols = numba.typed.List()
+    pg_cols.append(np.int64(0))
+    pg_cols.clear()
+    new_roots = numba.typed.List()
+    new_roots.append(np.int64(0))
+    new_roots.clear()
 
     for v in v_sub:
+        if labels[v] == -1:
+            labels[v] = v
+            new_roots.append(v)
+        root_v = labels[v]
+
         Q = numba.typed.List()
         Q.append(v)
         qi = 0
@@ -56,59 +66,42 @@ def _update_partition(
             qi += 1
 
             if labels[u] == -1:
-                labels[u] = v
+                labels[u] = root_v
 
                 partitions[u].clear()
-                partitions[v].add(u)
+                partitions[root_v].add(u)
 
             for idx in range(indptr[u], indptr[u + 1]):
                 v2 = indices[idx]
-                if min(cores[u], cores[v2]) < k_threshold:
-                    continue
                 if labels[v2] == -1:
                     Q.append(v2)
                 elif labels[v2] not in U:
                     Q.append(labels[v2])
                     U.add(labels[v2])
+                    pg_rows.append(root_v)
+                    pg_cols.append(
+                        labels[v2]
+                    )  # build partition graph. Each node is a partition and edge indicates path between two partitions
+
+    return pg_rows, pg_cols, new_roots
 
 
 @numba.njit
-def _get_community(partitions, labels, indptr, indices, cores, k_threshold, query):
-    """Find the community containing query.
-    indptr, indices: CSR arrays for neighbor lookup.
-    cores: int64 array of core numbers per node.
-    k_threshold: only follow edge (u, v2) if min(cores[u], cores[v2]) >= k_threshold.
-    labels[u] == -1 means unassigned."""
-
-    C = set()
-    Q = numba.typed.List()
-    Q.extend(partitions[labels[query]])
-    qi = 0
-    U = set()
-    U.add(query)
-
-    added_partition = set()
-
-    while qi < len(Q):
-        u = Q[qi]
-        qi += 1
-
-        # add a partition to returned community only on first encounter
-        if labels[u] not in added_partition:
-            added_partition.add(labels[u])
-
-            for member in partitions[labels[u]]:
-                C.add(member)
-
-        for idx in range(indptr[u], indptr[u + 1]):
-            v2 = indices[idx]
-            if min(cores[u], cores[v2]) < k_threshold:
-                continue
-            if labels[v2] != -1 and labels[v2] not in U:
-                Q.extend(partitions[labels[v2]])
-                U.add(labels[v2])
-
-    return C
+def _expand_component(partitions, roots):
+    """Collect all members from the given partition roots into a sorted array."""
+    members = set()
+    for i in range(len(roots)):
+        root = roots[i]
+        members.add(root)
+        for member in partitions[root]:
+            members.add(member)
+    out = np.empty(len(members), dtype=np.int64)
+    j = 0
+    for m in members:
+        out[j] = m
+        j += 1
+    out.sort()
+    return out
 
 
 @kcore.command()
@@ -132,26 +125,28 @@ def index(edgelist, output):
 @click.option("--outputdir", required=True, type=click.Path())
 @click.option("--delimiter", default="\t")
 def search(edgelist, index, nodelist, outputdir, delimiter="\t"):
+    # load edges
     edges = np.loadtxt(edgelist, dtype=np.int64, delimiter=delimiter)
     n = np.max(edges) + 1
     row = np.concatenate([edges[:, 0], edges[:, 1]])
     col = np.concatenate([edges[:, 1], edges[:, 0]])
-    data = np.ones(2 * len(edges), dtype=np.int8)
-    graph = sp.coo_matrix((data, (row, col)), shape=(n, n)).tocsr()
 
     # load index
     cores = pd.read_csv(index, sep=delimiter, header=None, names=["node", "core"])
     cores = cores.sort_values("node")["core"].to_numpy()
 
+    # graph stats
+    edgevals = np.minimum(cores[row], cores[col])  # core number by edge
+    order = np.argsort(edgevals)
+    edgevals = edgevals[order]
+    row = row[order]
+    col = col[order]  # order edges by minimal coreness of incident vertices
+    counts = np.bincount(edgevals)  # count edges with coreness k
+    indices = np.cumsum(counts)  # quickly find the CSR indices of edges with coreness k
+
     # initialize labels and partitions
     labels = np.full(n, -1, dtype=np.int64)
     partitions = _init_partitions(n)
-
-    # find k shell edges & incident nodes
-    k_shell_edges = collections.defaultdict(set)
-    for u, v in edges:
-        target_k = min(cores[u], cores[v])
-        k_shell_edges[target_k].add((u, v))
 
     # process the queries, sort by k values, fill in empty cells with largest possible k
     query_df = pd.read_csv(
@@ -170,45 +165,116 @@ def search(edgelist, index, nodelist, outputdir, delimiter="\t"):
 
     # map each k value to the queries at that level
     queries_at_k = collections.defaultdict(list)
-    for _, row in query_df.iterrows():
-        queries_at_k[int(row["k"])].append(int(row["q"]))
+    for _, r in query_df.iterrows():
+        queries_at_k[int(r["k"])].append(int(r["q"]))
+
+    # accumulated partition-graph edges (COO format)
+    # partition-graph: each node is a partition, and each edge indicates a path between two partitions. Essentially node contraction through a separate graph
+    all_pg_rows = []
+    all_pg_cols = []
+    active_roots_set = set()  # maintained incrementally
 
     # main loop
     for i in range(1, len(ks)):
-        added_edges = set()
-        for j in range(ks[i], ks[i - 1]):
-            added_edges = added_edges.union(k_shell_edges[j])
+        num_queries = len(queries_at_k.get(ks[i], []))
+        print(f"--- i={i}, k={ks[i]}, k_prev={ks[i-1]}, queries={num_queries} ---")
 
-        if len(added_edges) > 0:
-            added_edges_arr = np.array(list(added_edges), dtype=np.int64)
-            _update_partition(
+        # build CSR directly from sorted edge slices
+        t0 = time.time()
+        lo = indices[ks[i] - 1] if ks[i] > 0 else 0
+        hi = indices[min(ks[i - 1], len(indices)) - 1] if ks[i - 1] > 0 else 0
+        print(f"  lo: {lo}, hi: {hi}")
+
+        r_slice = row[lo:hi]
+        c_slice = col[lo:hi]
+        if len(r_slice) > 0:
+            # sort by coreness -> sort by source nodes
+            order_sub = np.argsort(r_slice)
+            sorted_row = r_slice[order_sub]
+            sorted_col = c_slice[order_sub].astype(np.int64)
+
+            # construct CSR
+            e_counts = np.bincount(sorted_row, minlength=n)
+            e_indptr = np.empty(n + 1, dtype=np.int64)
+            e_indptr[0] = 0
+            np.cumsum(e_counts, out=e_indptr[1:])
+        else:
+            sorted_col = np.empty(0, dtype=np.int64)
+            e_indptr = np.zeros(n + 1, dtype=np.int64)
+        t1 = time.time()
+        print(f"  build_csr: {t1-t0:.4f}s ({len(sorted_col)} edges)")
+
+        # extract v_sub: nodes incident to the edges in the new k-shell batch
+        t2 = time.time()
+        v_sub = np.where(np.diff(e_indptr) > 0)[0].astype(np.int64)
+        t3 = time.time()
+        print(f"  v_sub (CSR): {t3-t2:.4f}s ({len(v_sub)} nodes)")
+
+        # update partition information
+        if len(v_sub) > 0:
+            t4 = time.time()
+            pg_rows, pg_cols, new_roots = _update_partition(
                 partitions,
                 labels,
-                added_edges_arr,
-                graph.indptr,
-                graph.indices,
-                cores,
-                np.int64(ks[i]),
+                v_sub,
+                e_indptr,
+                sorted_col,
             )
+            t5 = time.time()
+            print(f"  update_partition: {t5-t4:.4f}s ({len(pg_rows)} pg edges)")
+
+            # accumulate partition-graph edges and roots
+            all_pg_rows.extend(pg_rows)
+            all_pg_cols.extend(pg_cols)
+            active_roots_set.update(new_roots)
 
         # answer all queries at this k level
-        for q in queries_at_k.get(ks[i], []):
-            community = _get_community(
-                partitions,
-                labels,
-                graph.indptr,
-                graph.indices,
-                cores,
-                np.int64(ks[i]),
-                np.int64(q),
-            )
-            outpath = Path(outputdir) / f"{q}/kcore_k{ks[i]}.txt"
-            outpath.parent.mkdir(parents=True, exist_ok=True)
-            with outpath.open("w") as outfile:
-                outfile.write("\n".join(map(str, sorted(community))))
-                if len(community):
-                    outfile.write("\n")
-                outfile.write("-1")
+        t7 = time.time()
+        current_queries = queries_at_k.get(ks[i], [])
+        if current_queries:
+            # build partition graph from accumulated COO edges
+            if all_pg_rows:
+                pg_r = np.array(all_pg_rows, dtype=np.int64)
+                pg_c = np.array(all_pg_cols, dtype=np.int64)
+                pg_data = np.ones(len(pg_r), dtype=np.int8)
+                pg_graph = sp.coo_matrix((pg_data, (pg_r, pg_c)), shape=(n, n)).tocsr()
+                n_components, comp_labels = connected_components(
+                    pg_graph, directed=False
+                )
+            else:
+                comp_labels = np.arange(n, dtype=np.int64)
+
+            # map component -> list of roots (lazy expansion)
+            comp_roots = collections.defaultdict(list)  # which CC the root belongs to
+            for root in active_roots_set:
+                comp_roots[comp_labels[root]].append(root)
+
+            # expanded cache: component -> full member set
+            comp_members = {}
+
+            for q in current_queries:
+                # find the component of the query's partition root
+                q_root = labels[q]
+                if q_root == -1:
+                    # query node not yet in any partition — singleton
+                    community_arr = np.array([q], dtype=np.int64)
+                else:
+                    q_comp = comp_labels[q_root]
+                    if q_comp not in comp_members:
+                        # expand on first access (JIT-compiled)
+                        roots = comp_roots.get(q_comp, np.empty(0, dtype=np.int64))
+                        comp_members[q_comp] = _expand_component(partitions, roots)
+                    community_arr = comp_members[q_comp]
+
+                outpath = Path(outputdir) / f"{q}/kcore_k{ks[i]}.txt"
+                outpath.parent.mkdir(parents=True, exist_ok=True)
+                with outpath.open("w") as outfile:
+                    outfile.write("\n".join(map(str, community_arr)))
+                    if len(community_arr):
+                        outfile.write("\n")
+                    outfile.write("-1")
+        t8 = time.time()
+        print(f"  get_community + write ({num_queries} queries): {t8-t7:.4f}s")
 
 
 if __name__ == "__main__":
