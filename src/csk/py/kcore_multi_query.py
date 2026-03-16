@@ -12,9 +12,6 @@ from itertools import groupby
 import time
 
 
-"""Note: this method solves the Multi-Query k-Core problem, which does not allow custom k's - it only works to find the k-core community a query node is in for the largest k possible."""
-
-
 @click.group()
 def kcore():
     pass
@@ -38,16 +35,12 @@ def _update_partition(partitions, labels, v_sub, indptr, indices):
     labels[u] == -1 means unassigned.
     Returns (pg_rows, pg_cols): partition-graph edges discovered during BFS."""
 
-    # typed list init trick: append+clear to set the element type
-    pg_rows = numba.typed.List()
-    pg_rows.append(np.int64(0))
-    pg_rows.clear()
-    pg_cols = numba.typed.List()
-    pg_cols.append(np.int64(0))
-    pg_cols.clear()
-    new_roots = numba.typed.List()
-    new_roots.append(np.int64(0))
-    new_roots.clear()
+    # partition graph
+    pg_rows = numba.typed.List.empty_list(np.int64)
+    pg_cols = numba.typed.List.empty_list(np.int64)
+
+    # new partitions (represented by the root nodes)
+    new_roots = numba.typed.List.empty_list(np.int64)
 
     for v in v_sub:
         if labels[v] == -1:
