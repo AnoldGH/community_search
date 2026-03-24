@@ -4,6 +4,10 @@ from pathlib import Path
 import click
 import networkit as nk
 
+import sys
+sys.setrecursionlimit(2000000)   # TODO: temporary remedy
+
+
 """
 K-core with an index structure based on ShellStruct (N. Barbieri, F. Bonchi, E. Galimberti, and F. Gullo. Efficient and effective community search. DMKD, 29(5):1406–1433, 2015.)
 Implement the advanced algorithm to build the index (Y. Fang, R. Cheng, S. Luo, and J. Hu. Effective community search for large attributed graphs. PVLDB, 9(12):1233–1244, Aug. 2016.)
@@ -48,6 +52,75 @@ class AdvancedIndexBuilder:
         self.anchor_map = (
             dict()
         )  # root -> anchor node_id (i.e., the node with least core number in the set)
+
+    def __getstate__(self):
+        """Iteratively flatten the CL-tree for pickle serialization,
+        avoiding deep recursion that causes SIGSEGV on large graphs."""
+        # Assign each CLTreeNode a unique integer id via BFS
+        node_to_id = {}
+        queue = []
+        # Collect all tree nodes reachable from v_to_treenode values
+        for treenode in self.v_to_treenode.values():
+            if id(treenode) not in node_to_id:
+                # Walk up to the root first
+                root = treenode
+                while root.parent is not None:
+                    root = root.parent
+                # BFS from root
+                bfs = [root]
+                while bfs:
+                    cur = bfs.pop(0)
+                    if id(cur) not in node_to_id:
+                        node_to_id[id(cur)] = len(node_to_id)
+                        bfs.extend(cur.children)
+
+        id_to_node = {v: k for k, v in node_to_id.items()}
+        # Build a flat list: each entry is (core_num, vertex_set, parent_id, [child_ids])
+        obj_map = {}  # python id(obj) -> obj, for lookup
+        for treenode in self.v_to_treenode.values():
+            obj_map[id(treenode)] = treenode
+            if treenode.parent is not None:
+                obj_map[id(treenode.parent)] = treenode.parent
+        # BFS again to capture all nodes including those not in v_to_treenode
+        for py_id in list(node_to_id.keys()):
+            if py_id in obj_map:
+                for child in obj_map[py_id].children:
+                    obj_map[id(child)] = child
+
+        flat_nodes = [None] * len(node_to_id)
+        for py_id, idx in node_to_id.items():
+            node = obj_map[py_id]
+            parent_idx = node_to_id[id(node.parent)] if node.parent is not None else -1
+            child_idxs = [node_to_id[id(c)] for c in node.children]
+            flat_nodes[idx] = (node.core_num, node.vertex_set, parent_idx, child_idxs)
+
+        # Map v_to_treenode: vertex -> flat index
+        v_to_idx = {v: node_to_id[id(tn)] for v, tn in self.v_to_treenode.items()}
+
+        return {"flat_nodes": flat_nodes, "v_to_idx": v_to_idx}
+
+    def __setstate__(self, state):
+        """Reconstruct the CL-tree iteratively from the flat representation."""
+        flat_nodes = state["flat_nodes"]
+        v_to_idx = state["v_to_idx"]
+
+        # Rebuild CLTreeNode objects without parent/child links first
+        tree_nodes = []
+        for core_num, vertex_set, _, _ in flat_nodes:
+            tree_nodes.append(CLTreeNode(core_num, vertex_set))
+
+        # Wire up parent/child pointers
+        for idx, (_, _, parent_idx, child_idxs) in enumerate(flat_nodes):
+            node = tree_nodes[idx]
+            if parent_idx != -1:
+                node.parent = tree_nodes[parent_idx]
+            for ci in child_idxs:
+                node.children.add(tree_nodes[ci])
+
+        # Rebuild v_to_treenode
+        self.v_to_treenode = {v: tree_nodes[idx] for v, idx in v_to_idx.items()}
+        self.graph = None
+        self.anchor_map = {}
 
     def build(self):
         core = nk.centrality.CoreDecomposition(self.graph).run()
@@ -166,7 +239,7 @@ def kcore():
 @click.option("--edgelist", required=True, type=click.Path(exists=True))
 @click.option("--output", required=True, type=click.Path())
 def index(edgelist, output):
-    graph = nk.graphio.EdgeListReader(",", 0).read(edgelist)
+    graph = nk.graphio.EdgeListReader("\t", 0).read(edgelist)
 
     # obtain index
     indexer = AdvancedIndexBuilder(graph)
@@ -184,6 +257,7 @@ def index(edgelist, output):
 def search(index, nodelist, outputdir):
     with open(index, "rb") as f:
         indexer = pickle.load(f)
+    print(f"Indexer loaded")
 
     def ancestors(node):
         """Return the set of all ancestors (including the node itself)."""
@@ -191,6 +265,7 @@ def search(index, nodelist, outputdir):
         while node is not None:
             result.add(node)
             node = node.parent
+        print(f"Ancestor found for node {node}")
         return result
 
     def find_kcore(queries, k):
@@ -235,6 +310,7 @@ def search(index, nodelist, outputdir):
             stack.extend(cur.children)
         return lca.core_num, sorted(vertices)
 
+    count = 0
     with open(nodelist) as nodefile:
         for line in nodefile.readlines():
             parts = line.strip().split(" ")
@@ -243,15 +319,26 @@ def search(index, nodelist, outputdir):
             queries = [int(q) for q in queries_str.split(",")]
 
             resolved_k, component = find_kcore(queries, k)
-            outpath = Path(outputdir) / f"{queries_str}/kcore_k{resolved_k}.txt"
+            # Use query string as dir name, but fall back to a descriptive
+            # name derived from the nodelist filename when it's too long for
+            # the filesystem (max 255 bytes).
+            dirname = queries_str
+            if len(dirname.encode("utf-8")) > 255:
+                dirname = Path(nodelist).stem + f"_line{count}"
+            outpath = Path(outputdir) / f"{dirname}/kcore_k{resolved_k}.txt"
             outpath.parent.mkdir(parents=True, exist_ok=True)
 
             with outpath.open("w") as outfile:
                 outfile.write("\n".join(map(str, component)))
                 if len(component):
                     outfile.write("\n")
-                outfile.write("-1")
+                #outfile.write("-1")
 
+            count += 1
+            if count % 50 == 0: 
+                print(f"Finished {count} queries...")
+
+    print("Search jobs completed.")
 
 if __name__ == "__main__":
     kcore()
