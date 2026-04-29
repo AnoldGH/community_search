@@ -309,6 +309,8 @@ def search(index, nodelist, outputdir):
 
         # LCA is the deepest common ancestor (highest core_num)
         lca = max(lca_candidates, key=lambda n: n.core_num)
+        while lca.parent is not None and lca.core_num == lca.parent.core_num:
+            lca = lca.parent
 
         if k != -1 and lca.core_num < k:
             return k, []
